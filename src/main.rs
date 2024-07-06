@@ -2,12 +2,12 @@ use blake2::digest::{Update, VariableOutput};
 use blake2::{Blake2bVar, Digest};
 use clap::Parser;
 use image;
+use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::{borrow::BorrowMut, collections::HashMap, hash::Hash};
 use std::{fs, io::Write};
 use std::{io, str::Bytes};
-use image::GenericImageView;
 
 use base64::prelude::*;
 use std::path;
@@ -136,17 +136,19 @@ impl QrSendMd5Data {
 }
 
 fn decode(img: &image::DynamicImage) -> Option<Vec<u8>> {
-    let decoder = bardecoder::default_decoder();
-    let results = decoder.decode(img);
-
-    // Base64 decode as well
-    if !results.is_empty() {
-        if let Ok(result) = &results[0] {
-            let decoded = BASE64_STANDARD.decode(result).ok()?;
-            return Some(decoded);
+    let mut scanner = zbar_rust::ZBarImageScanner::new();
+    let (w, h) = img.dimensions();
+    let results = scanner.scan_y800(img.clone().into_luma8().into_raw(), w, h);
+    match results {
+        Ok(rvec) => {
+            for r in rvec {
+                let s = String::from_utf8(r.data).unwrap();
+                return Some(BASE64_STANDARD.decode(&s.as_bytes()).unwrap());
+            }
+            None
         }
+        Err(_) => None
     }
-    None
 }
 
 fn guess_hash_len(data: &[u8]) -> Option<usize> {
