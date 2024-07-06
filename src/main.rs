@@ -5,7 +5,7 @@ use image;
 use rqrr;
 use serde::{Deserialize, Serialize};
 use serde_json;
-use std::collections::HashMap;
+use std::{borrow::BorrowMut, collections::HashMap, hash::Hash};
 use std::{fs, io::Write};
 use std::{io, str::Bytes};
 
@@ -28,10 +28,12 @@ impl IntoIterator for ImageSequence {
     type IntoIter = ImageSequenceIterator;
 
     fn into_iter(self) -> Self::IntoIter {
-        let img_filenames = fs::read_dir(&self.image_dir)
+        let mut img_filenames: Vec<String> = fs::read_dir(&self.image_dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_string())
             .collect();
+        // sort by filename
+        img_filenames.sort();
         ImageSequenceIterator {
             image_dir: self.image_dir,
             img_filenames: img_filenames,
@@ -49,13 +51,24 @@ impl Iterator for ImageSequenceIterator {
     type Item = image::DynamicImage;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.img_filenames.len() as u32 {
+            return None;
+        }
         let image_path = self
             .image_dir
             .join(&self.img_filenames[self.index as usize]);
         self.index += 1;
+        println!("reading image: {:?}", image_path);
         match image::open(image_path) {
             Ok(image) => Some(image),
             Err(_) => None,
+        }
+    }
+}
+impl ImageSequenceIterator {
+    fn tick_backward(&mut self) {
+        if self.index > 0 {
+            self.index -= 1;
         }
     }
 }
@@ -103,13 +116,6 @@ impl QrSendData {
             hash: hash,
         }
     }
-    fn verify(&self) -> bool {
-        let mut hasher = Blake2bVar::new(self.hash.len()).unwrap();
-        hasher.update(&self.data);
-        let mut computed = vec![0; self.hash.len()];
-        hasher.finalize_variable(&mut computed).unwrap();
-        computed == self.hash
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -126,13 +132,6 @@ impl QrSendMd5Data {
             data: data,
             hash: hash,
         }
-    }
-    fn verify(&self) -> bool {
-        let mut hasher = blake2::Blake2bVar::new(self.hash.len()).unwrap();
-        hasher.update(&self.data);
-        let mut computed = vec![0; self.hash.len()];
-        hasher.finalize_variable(&mut computed).unwrap();
-        computed == self.hash
     }
 }
 
@@ -158,8 +157,6 @@ fn guess_hash_len(data: &[u8]) -> Option<usize> {
         let mut computed = vec![0; i];
         hasher.update(content);
         hasher.finalize_variable(&mut computed).unwrap();
-        println!("{:?}", computed);
-        println!("{:?}", hash);
         if computed == hash {
             return Some(i);
         }
@@ -167,78 +164,145 @@ fn guess_hash_len(data: &[u8]) -> Option<usize> {
     None
 }
 
+struct QrSendDecoder {
+    metadata: Option<QrSendMetadata>,
+    data_segments: HashMap<u64, QrSendData>,
+    total_md5: Vec<u8>,
+}
+impl QrSendDecoder {
+    fn new() -> Self {
+        QrSendDecoder {
+            metadata: None,
+            data_segments: HashMap::new(),
+            total_md5: Vec::new(),
+        }
+    }
+    fn verify_segment(&self, data: &[u8]) -> bool {
+        let hash_len = match &self.metadata {
+            Some(md) => md.hash_len as usize,
+            None => match guess_hash_len(data) {
+                Some(len) => len,
+                None => return false,
+            },
+        };
+        let hash = &data[data.len() - hash_len..];
+        let mut hasher = Blake2bVar::new(hash_len).unwrap();
+        let mut computed = vec![0u8; hash_len];
+        hasher.update(&data[0..data.len() - hash_len]);
+        hasher.finalize_variable(&mut computed).unwrap();
+        computed == hash
+    }
+    fn get_metadata(&mut self, img_iter: &mut ImageSequenceIterator) {
+        let mut md_str = String::new();
+        for img in img_iter {
+            match decode(&img) {
+                Some(data) => {
+                    if !self.verify_segment(&data) {
+                        continue;
+                    }
+                    let hash_len = guess_hash_len(&data).unwrap();
+                    if data[0] == 'M' as u8 {
+                        md_str.push_str(
+                            std::str::from_utf8(&data[1..data.len() - hash_len]).unwrap(),
+                        );
+                    }
+                    if data[data.len() - hash_len - 1] != b'}' {
+                        continue;
+                    }
+                    self.metadata = Some(serde_json::from_str(&md_str).unwrap());
+                    return;
+                }
+                None => continue,
+            }
+        }
+    }
+    fn get_data(&mut self, img_iter: &mut ImageSequenceIterator) {
+        for img in img_iter {
+            match decode(&img) {
+                Some(data) => {
+                    if !self.verify_segment(&data) {
+                        continue;
+                    }
+                    match data[0] {
+                        b'M' => continue,
+                        b'D' => {
+                            let data =
+                                QrSendData::from_bytes(&data[1..], &self.metadata.clone().unwrap());
+                            println!("got data id: {}", data.id);
+                            self.data_segments.insert(data.id, data);
+                        }
+                        b'H' => {
+                            return;
+                        }
+                        _ => continue,
+                    }
+                }
+                None => continue,
+            }
+        }
+    }
+    fn get_md5(&mut self, img_iter: &mut ImageSequenceIterator) {
+        for img in img_iter {
+            match decode(&img) {
+                Some(data) => {
+                    if !self.verify_segment(&data) {
+                        continue;
+                    }
+                    match data[0] {
+                        b'H' => {
+                            let md5 = QrSendMd5Data::from_bytes(
+                                &data[1..],
+                                &self.metadata.clone().unwrap(),
+                            );
+                            self.total_md5 = md5.data;
+                            return;
+                        }
+                        _ => continue,
+                    }
+                }
+                None => continue,
+            }
+        }
+        return;
+    }
+}
+
 fn main() {
     let args = Args::parse();
     let img_seq = ImageSequence {
         image_dir: path::PathBuf::from(args.image_dir),
     };
-    let mut md_recved = false;
-    let mut md_str = String::new();
-    let mut contents = Vec::new();
-    let mut id_end = false;
-    let mut md5_vec = Vec::new();
-    let mut md_vec = Vec::new();
-    for img in img_seq.into_iter() {
-        if !md_recved {
-            let data = decode(&img).unwrap();
-            let hash_len = guess_hash_len(&data).unwrap();
-            let content = data[0..data.len() - hash_len].to_vec();
-            let content_str = String::from_utf8(content).unwrap();
-            md_str.push_str(&content_str);
-            if !md_str.ends_with("}") {
-                continue;
-            };
-            md_recved = true;
-        }
-        let md: QrSendMetadata = serde_json::from_str(&md_str).unwrap();
-        md_vec.push(md.clone());
-        match decode(&img) {
-            Some(data) => {
-                if id_end {
-                    // get md5
-                    let md5_data = QrSendMd5Data::from_bytes(&data, &md);
-                    if md5_data.verify() {
-                        println!("got md5");
-                        md5_vec.push(md5_data);
-                        break;
-                    }
-                }
-                let data = QrSendData::from_bytes(&data, &md);
-                let data_id = data.id;
-                println!("got qrcode: {}", data_id);
-                if data.verify() {
-                    contents.push(data);
-                }
-                id_end = data_id == (&md.qrcode_count - 1);
+    let mut decoder = QrSendDecoder::new();
+    let mut img_iter = img_seq.into_iter();
+    decoder.get_metadata(&mut img_iter);
+    println!("got metadata: {:?}", decoder.metadata);
+    decoder.get_data(&mut img_iter);
+    img_iter.tick_backward();
+    decoder.get_md5(&mut img_iter);
+    if let Some(md) = &decoder.metadata {
+        println!("total qrcode count: {}", md.qrcode_count);
+        println!("received qrcode count: {}", decoder.data_segments.len());
+        if md.qrcode_count == decoder.data_segments.len() as u64 {
+            let mut data = Vec::new();
+            for i in 0..md.qrcode_count {
+                let segment = decoder.data_segments.get(&i).unwrap();
+                data.extend_from_slice(&segment.data);
             }
-            None => (),
-        }
-    }
-    let mut valid_pieces = HashMap::new();
-    for p in contents {
-        valid_pieces.insert(p.id, p);
-    }
-    // if all qrcodes are valid, compare md5
-    if valid_pieces.len() == md_vec[0].qrcode_count as usize {
-        let md5_ = md5_vec[0].clone();
-        let joined_pieces = valid_pieces.values().fold(Vec::new(), |mut acc, x| {
-            acc.extend_from_slice(&x.data);
-            acc
-        });
-        let computed_md5 = md5::compute(&joined_pieces);
-        if format!("{:x}", computed_md5) == hex::encode(md5_.data) {
-            println!("md5 matched");
-            let mut file = fs::File::create(args.output_file).unwrap();
-            file.write_all(&joined_pieces).unwrap();
+            let computed_md5 = md5::compute(&data);
+            if hex::encode(computed_md5.0) == hex::encode(&decoder.total_md5) {
+                println!("md5 check passed");
+                let mut output_file = fs::File::create(args.output_file).unwrap();
+                output_file.write_all(&data).unwrap();
+            } else {
+                println!("md5 check failed");
+                println!("computed md5: {}", hex::encode(computed_md5.0));
+                println!("received md5: {}", hex::encode(&decoder.total_md5));
+            }
         } else {
-            println!("md5 not matched");
+            let missed_segment = (0..md.qrcode_count)
+                .filter(|i| !decoder.data_segments.contains_key(i))
+                .collect::<Vec<u64>>();
+            println!("missed segments: {:?}", missed_segment);
         }
     }
-}
-
-#[test]
-fn decode_1107() {
-    let img = image::open("fixtures/2imgs/frame_001113.jpg").unwrap();
-    let data = decode(&img).unwrap();
-    println!("{:?}", data);
 }
